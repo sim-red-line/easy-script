@@ -427,7 +427,7 @@
 
       <div class="toolbar">
         <button class="btn mobile-editor-toggle" id="mobileEditorBtn" title="대본 편집">✎</button>
-        <button class="btn primary" id="startBtn">● 음성 추적 시작</button>
+        <button class="btn primary" id="startBtn">● 음성 추적</button>
         <button class="btn danger" id="stopBtn" hidden>■ 정지</button>
         <button class="btn hide-focus" id="applyBtn">대본 적용</button>
         <button class="btn hide-focus" id="fileBtn">파일 열기</button>
@@ -465,6 +465,7 @@
       <div class="status">
         <span class="dot" id="statusDot"></span>
         <span class="status-text" id="statusText">준비됨</span>
+        <span class="control" style="min-height:28px;padding:0 8px">10 Hz</span>
       </div>
     </header>
 
@@ -477,7 +478,7 @@
         <div class="editor-wrap">
           <textarea id="scriptInput" spellcheck="false" placeholder="여기에 발표 대본을 붙여넣으세요.
 
-말한 내용과 대본을 실시간으로 비교하고, 초록색 큐를 한 박자 앞에 표시합니다."></textarea>
+최신 음성 인식 결과를 0.1초마다 대본과 다시 비교하고, 초록색 큐를 한 박자 앞에 표시합니다."></textarea>
         </div>
         <div class="panel-foot">
           단축키: <b>Space</b> 시작/정지 · <b>←/→</b> 위치 이동 · <b>↑/↓</b> 스크롤 · <b>F</b> 집중 모드<br>
@@ -557,6 +558,15 @@
       let finalTokens = [];
       let recognitionRestartTimer = null;
       let lastScrollAt = 0;
+
+      // 음성 인식 이벤트는 브라우저가 임의 주기로 전달한다.
+      // 가장 최근 결과를 보관하고 100ms마다 대본 위치를 다시 계산한다.
+      const TRACK_INTERVAL_MS = 100;
+      let trackingTimer = null;
+      let latestInterimText = "";
+      let pendingFinalTexts = [];
+      let latestTranscriptChanged = false;
+      let lastProcessedTranscript = "";
 
       function toast(message) {
         els.toast.textContent = message;
@@ -779,34 +789,71 @@
         };
       }
 
-      function processTranscript(text, isFinal) {
+      function processTranscript(text, isFinal, force = false) {
         const tokens = tokenizeSpeech(text);
         if (!tokens.length) return;
 
         if (isFinal) {
           finalTokens.push(...tokens);
-          if (finalTokens.length > 40) finalTokens = finalTokens.slice(-40);
+          if (finalTokens.length > 50) finalTokens = finalTokens.slice(-50);
         }
 
-        const combined = [...finalTokens.slice(-12), ...(!isFinal ? tokens : [])].slice(-14);
+        const combined = [
+          ...finalTokens.slice(-14),
+          ...(!isFinal ? tokens : [])
+        ].slice(-18);
+
+        const signature = combined.join(" ");
+        if (!force && signature === lastProcessedTranscript) return;
+        lastProcessedTranscript = signature;
+
         const match = alignSpeech(combined);
         const threshold = Number(els.sensitivity.value) / 100;
 
         els.transcriptText.textContent = text;
         els.transcriptBox.classList.add("show");
-        clearTimeout(processTranscript.hideTimer);
-        processTranscript.hideTimer = setTimeout(() => {
-          if (!listening) els.transcriptBox.classList.remove("show");
-        }, 1500);
 
         if (match && match.confidence >= threshold) {
           const maxForwardJump = isFinal ? 42 : 20;
           const bounded = Math.min(match.index, currentIndex + maxForwardJump);
           const next = bounded < currentIndex - 4 ? currentIndex : bounded;
           updateCurrent(next, true);
-          setStatus(`추적 중 · ${Math.round(match.confidence * 100)}%`, true);
+          setStatus(`0.1초 추적 · ${Math.round(match.confidence * 100)}%`, true);
         } else {
-          setStatus("듣는 중 · 대본 일치 탐색", true);
+          setStatus("0.1초 추적 · 대본 일치 탐색", true);
+        }
+      }
+
+      function runTrackingTick() {
+        if (!listening) return;
+
+        // 확정된 문장은 한 번만 누적한다.
+        while (pendingFinalTexts.length) {
+          const finalText = pendingFinalTexts.shift();
+          processTranscript(finalText, true, true);
+        }
+
+        // 중간 인식 결과는 같은 문장이어도 100ms마다 재대조한다.
+        // 새 단어가 들어오는 순간 바로 위치를 보정하고, 그 사이에도 UI를 유지한다.
+        if (latestInterimText.trim()) {
+          processTranscript(latestInterimText, false, true);
+        } else if (latestTranscriptChanged && finalTokens.length) {
+          const tail = finalTokens.slice(-14).join(" ");
+          processTranscript(tail, false, true);
+        }
+
+        latestTranscriptChanged = false;
+      }
+
+      function startTrackingLoop() {
+        stopTrackingLoop();
+        trackingTimer = setInterval(runTrackingTick, TRACK_INTERVAL_MS);
+      }
+
+      function stopTrackingLoop() {
+        if (trackingTimer) {
+          clearInterval(trackingTimer);
+          trackingTimer = null;
         }
       }
 
@@ -825,12 +872,20 @@
 
         r.onresult = (event) => {
           let interim = "";
+
           for (let i = event.resultIndex; i < event.results.length; i++) {
-            const text = event.results[i][0].transcript;
-            if (event.results[i].isFinal) processTranscript(text, true);
-            else interim += text;
+            const text = event.results[i][0].transcript.trim();
+            if (!text) continue;
+
+            if (event.results[i].isFinal) {
+              pendingFinalTexts.push(text);
+            } else {
+              interim += (interim ? " " : "") + text;
+            }
           }
-          if (interim.trim()) processTranscript(interim, false);
+
+          latestInterimText = interim;
+          latestTranscriptChanged = true;
         };
 
         r.onerror = (event) => {
@@ -846,6 +901,7 @@
           if (["not-allowed", "service-not-allowed", "audio-capture"].includes(event.error)) {
             listening = false;
             manuallyStopped = true;
+            stopTrackingLoop();
             updateButtons();
           }
         };
@@ -881,13 +937,19 @@
         manuallyStopped = false;
         listening = true;
         finalTokens = [];
+        pendingFinalTexts = [];
+        latestInterimText = "";
+        latestTranscriptChanged = false;
+        lastProcessedTranscript = "";
         recognition = createRecognition();
+        startTrackingLoop();
 
         try {
           recognition.start();
           updateButtons();
         } catch (error) {
           listening = false;
+          stopTrackingLoop();
           updateButtons();
           toast("음성 인식을 시작하지 못했습니다.");
         }
@@ -897,8 +959,12 @@
         manuallyStopped = true;
         listening = false;
         clearTimeout(recognitionRestartTimer);
+        stopTrackingLoop();
         try { recognition?.stop(); } catch (_) {}
         recognition = null;
+        latestInterimText = "";
+        pendingFinalTexts = [];
+        latestTranscriptChanged = false;
         updateButtons();
         els.transcriptBox.classList.remove("show");
         setStatus("정지됨", false);
