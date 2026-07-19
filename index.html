@@ -288,16 +288,8 @@
       text-underline-offset: .18em;
     }
     .word.current {
-      --cue-progress: 0%;
       color: #04110a;
-      background:
-        linear-gradient(
-          90deg,
-          var(--accent) 0%,
-          #c8ffdd var(--cue-progress),
-          rgba(115,226,167,.22) var(--cue-progress),
-          rgba(115,226,167,.10) 100%
-        );
+      background: linear-gradient(135deg, var(--accent), #c8ffdd);
       box-shadow: 0 .12em .45em rgba(115,226,167,.20);
     }
     .line-break { display: block; height: .6em; }
@@ -435,7 +427,7 @@
 
       <div class="toolbar">
         <button class="btn mobile-editor-toggle" id="mobileEditorBtn" title="대본 편집">✎</button>
-        <button class="btn primary" id="startBtn">● 0.1초 음성 추적</button>
+        <button class="btn primary" id="startBtn">● 음성 추적</button>
         <button class="btn danger" id="stopBtn" hidden>■ 정지</button>
         <button class="btn hide-focus" id="applyBtn">대본 적용</button>
         <button class="btn hide-focus" id="fileBtn">파일 열기</button>
@@ -486,7 +478,7 @@
         <div class="editor-wrap">
           <textarea id="scriptInput" spellcheck="false" placeholder="여기에 발표 대본을 붙여넣으세요.
 
-초록색 읽기 위치가 0.1초마다 계속 움직이며, 새 음성 인식 결과가 들어올 때마다 정확한 대본 위치로 보정됩니다."></textarea>
+최신 음성 인식 결과를 0.1초마다 대본과 다시 비교하고, 초록색 큐를 한 박자 앞에 표시합니다."></textarea>
         </div>
         <div class="panel-foot">
           단축키: <b>Space</b> 시작/정지 · <b>←/→</b> 위치 이동 · <b>↑/↓</b> 스크롤 · <b>F</b> 집중 모드<br>
@@ -567,33 +559,14 @@
       let recognitionRestartTimer = null;
       let lastScrollAt = 0;
 
-      // 초록색 읽기 위치는 100ms마다 실제로 갱신한다.
-      // 음성 인식 결과가 들어오면 정확한 대본 위치로 보정하고,
-      // 결과 사이 구간은 마이크 음성 활동과 추정 말하기 속도로 전진한다.
+      // 음성 인식 이벤트는 브라우저가 임의 주기로 전달한다.
+      // 가장 최근 결과를 보관하고 100ms마다 대본 위치를 다시 계산한다.
       const TRACK_INTERVAL_MS = 100;
-      const DEFAULT_SPEECH_RATE_WPS = 2.35;
-      const MAX_PREDICTION_AHEAD_WORDS = 12;
-
       let trackingTimer = null;
       let latestInterimText = "";
       let pendingFinalTexts = [];
       let latestTranscriptChanged = false;
       let lastProcessedTranscript = "";
-
-      let predictedPosition = 0;
-      let speechRateWps = DEFAULT_SPEECH_RATE_WPS;
-      let lastTrackingTickAt = 0;
-      let lastMatchedAt = 0;
-      let lastMatchedIndex = 0;
-      let lastRenderedCueIndex = -1;
-      let lastSpeechEventAt = 0;
-
-      let micStream = null;
-      let audioContext = null;
-      let analyser = null;
-      let audioSamples = null;
-      let noiseFloor = 0.012;
-      let voiceActive = false;
 
       function toast(message) {
         els.toast.textContent = message;
@@ -677,11 +650,6 @@
         localStorage.setItem("voicecue.script", text);
         scriptWords = splitScript(text);
         currentIndex = 0;
-        predictedPosition = 0;
-        speechRateWps = DEFAULT_SPEECH_RATE_WPS;
-        lastMatchedAt = 0;
-        lastMatchedIndex = 0;
-        lastRenderedCueIndex = -1;
         finalTokens = [];
         renderScript();
         updateCurrent(0, false);
@@ -715,103 +683,30 @@
         return Math.max(1, Number(els.leadWords?.value || 3));
       }
 
-      function getCuePosition() {
-        if (!scriptWords.length) return 0;
-        return Math.min(
-          scriptWords.length - 1,
-          Math.max(0, predictedPosition + getLeadWords())
-        );
-      }
-
       function getCueIndex() {
-        return Math.min(scriptWords.length - 1, Math.floor(getCuePosition()));
-      }
-
-      function renderCue(shouldScroll = true) {
-        if (!scriptWords.length) return;
-
-        const cuePosition = getCuePosition();
-        const cueIndex = Math.floor(cuePosition);
-        const cueFraction = Math.max(0, Math.min(1, cuePosition - cueIndex));
-        const all = els.scriptView.querySelectorAll(".word");
-        const fadedBefore = Math.max(0, Math.floor(predictedPosition) - 24);
-
-        all.forEach((el, i) => {
-          el.classList.toggle("past", i < fadedBefore);
-          el.classList.toggle(
-            "near",
-            i >= Math.floor(currentIndex) && i < cueIndex
-          );
-          el.classList.toggle("current", i === cueIndex);
-
-          if (i === cueIndex) {
-            // 단어 내부의 초록색 채움도 0.1초마다 진행된다.
-            el.style.setProperty(
-              "--cue-progress",
-              `${Math.max(8, Math.round(cueFraction * 100))}%`
-            );
-          } else {
-            el.style.removeProperty("--cue-progress");
-          }
-        });
-
-        const progress = scriptWords.length <= 1
-          ? 0
-          : cuePosition / (scriptWords.length - 1);
-        els.progressBar.style.width = `${Math.round(progress * 1000) / 10}%`;
-
-        const cueWordChanged = cueIndex !== lastRenderedCueIndex;
-        lastRenderedCueIndex = cueIndex;
-        if (shouldScroll && cueWordChanged) scrollToCurrent();
+        return Math.min(scriptWords.length - 1, currentIndex + getLeadWords());
       }
 
       function updateCurrent(index, shouldScroll = true) {
         if (!scriptWords.length) return;
 
         currentIndex = Math.max(0, Math.min(scriptWords.length - 1, index));
-        predictedPosition = currentIndex;
-        lastMatchedIndex = currentIndex;
-        lastMatchedAt = performance.now();
-        renderCue(shouldScroll);
-      }
+        const cueIndex = getCueIndex();
+        const all = els.scriptView.querySelectorAll(".word");
+        const fadedBefore = Math.max(0, currentIndex - 24);
 
-      function applyRecognitionCorrection(index) {
-        if (!scriptWords.length) return;
+        all.forEach((el, i) => {
+          el.classList.toggle("past", i < fadedBefore);
+          // 인식된 위치부터 초록 큐 직전까지는 다음에 읽을 흐름으로 표시
+          el.classList.toggle("near", i >= currentIndex && i < cueIndex);
+          // 초록색은 실제 인식 위치보다 설정한 단어 수만큼 앞서 표시
+          el.classList.toggle("current", i === cueIndex);
+        });
 
-        const now = performance.now();
-        const matchedIndex = Math.max(
-          0,
-          Math.min(scriptWords.length - 1, index)
-        );
+        const progress = scriptWords.length <= 1 ? 0 : cueIndex / (scriptWords.length - 1);
+        els.progressBar.style.width = `${Math.round(progress * 1000) / 10}%`;
 
-        // 실제 인식 위치 변화량으로 사용자의 현재 말하기 속도를 추정한다.
-        if (lastMatchedAt > 0 && matchedIndex > lastMatchedIndex) {
-          const seconds = (now - lastMatchedAt) / 1000;
-          const words = matchedIndex - lastMatchedIndex;
-
-          if (seconds >= 0.18 && seconds <= 5 && words <= 30) {
-            const observedRate = Math.max(
-              1.0,
-              Math.min(5.5, words / seconds)
-            );
-            speechRateWps = speechRateWps * 0.68 + observedRate * 0.32;
-          }
-        }
-
-        lastMatchedAt = now;
-        lastMatchedIndex = matchedIndex;
-        currentIndex = matchedIndex;
-
-        // 인식 결과가 예측보다 앞이면 즉시 따라잡는다.
-        // 예측이 조금 앞선 경우에는 뒤로 튀지 않게 유지하되,
-        // 너무 멀리 나갔으면 인식 위치 근처로 되돌린다.
-        if (matchedIndex >= predictedPosition) {
-          predictedPosition = matchedIndex;
-        } else if (predictedPosition - matchedIndex > 7) {
-          predictedPosition = matchedIndex + 1.5;
-        }
-
-        renderCue(true);
+        if (shouldScroll) scrollToCurrent();
       }
 
       function scrollToCurrent() {
@@ -922,135 +817,36 @@
           const maxForwardJump = isFinal ? 42 : 20;
           const bounded = Math.min(match.index, currentIndex + maxForwardJump);
           const next = bounded < currentIndex - 4 ? currentIndex : bounded;
-          applyRecognitionCorrection(next);
-          setStatus(
-            `실시간 0.1초 · ${Math.round(speechRateWps * 60)} WPM · ${Math.round(match.confidence * 100)}%`,
-            true
-          );
+          updateCurrent(next, true);
+          setStatus(`0.1초 추적 · ${Math.round(match.confidence * 100)}%`, true);
         } else {
           setStatus("0.1초 추적 · 대본 일치 탐색", true);
         }
       }
 
-      function sampleVoiceActivity() {
-        if (!analyser || !audioSamples) {
-          // 분석기가 없으면 최근 음성 인식 이벤트를 짧게 음성 활동으로 간주한다.
-          voiceActive = performance.now() - lastSpeechEventAt < 650;
-          return voiceActive;
-        }
-
-        analyser.getByteTimeDomainData(audioSamples);
-        let sumSquares = 0;
-
-        for (let i = 0; i < audioSamples.length; i++) {
-          const sample = (audioSamples[i] - 128) / 128;
-          sumSquares += sample * sample;
-        }
-
-        const rms = Math.sqrt(sumSquares / audioSamples.length);
-
-        // 조용할 때 주변 소음 기준을 천천히 학습한다.
-        if (rms < noiseFloor * 2.2) {
-          noiseFloor = noiseFloor * 0.985 + rms * 0.015;
-        }
-
-        const threshold = Math.max(0.018, noiseFloor * 2.25);
-        voiceActive = rms > threshold;
-        return voiceActive;
-      }
-
-      async function startAudioMeter() {
-        if (!navigator.mediaDevices?.getUserMedia) return;
-
-        try {
-          micStream = await navigator.mediaDevices.getUserMedia({
-            audio: {
-              echoCancellation: true,
-              noiseSuppression: true,
-              autoGainControl: true
-            }
-          });
-
-          audioContext = new (window.AudioContext || window.webkitAudioContext)();
-          const source = audioContext.createMediaStreamSource(micStream);
-          analyser = audioContext.createAnalyser();
-          analyser.fftSize = 512;
-          analyser.smoothingTimeConstant = 0.35;
-          audioSamples = new Uint8Array(analyser.fftSize);
-          source.connect(analyser);
-        } catch (_) {
-          // Web Speech API만 가능한 환경에서도 최근 인식 이벤트를 이용해 계속 작동한다.
-          micStream = null;
-          audioContext = null;
-          analyser = null;
-          audioSamples = null;
-        }
-      }
-
-      function stopAudioMeter() {
-        try {
-          micStream?.getTracks().forEach(track => track.stop());
-        } catch (_) {}
-
-        try {
-          audioContext?.close();
-        } catch (_) {}
-
-        micStream = null;
-        audioContext = null;
-        analyser = null;
-        audioSamples = null;
-        voiceActive = false;
-      }
-
       function runTrackingTick() {
-        if (!listening || !scriptWords.length) return;
+        if (!listening) return;
 
-        const now = performance.now();
-        const elapsed = lastTrackingTickAt
-          ? Math.min(0.25, (now - lastTrackingTickAt) / 1000)
-          : TRACK_INTERVAL_MS / 1000;
-        lastTrackingTickAt = now;
-
-        // 새 음성 인식 문장이 있을 때만 정확한 대본 매칭을 수행한다.
+        // 확정된 문장은 한 번만 누적한다.
         while (pendingFinalTexts.length) {
           const finalText = pendingFinalTexts.shift();
-          processTranscript(finalText, true, false);
+          processTranscript(finalText, true, true);
         }
 
-        if (latestTranscriptChanged && latestInterimText.trim()) {
-          processTranscript(latestInterimText, false, false);
+        // 중간 인식 결과는 같은 문장이어도 100ms마다 재대조한다.
+        // 새 단어가 들어오는 순간 바로 위치를 보정하고, 그 사이에도 UI를 유지한다.
+        if (latestInterimText.trim()) {
+          processTranscript(latestInterimText, false, true);
+        } else if (latestTranscriptChanged && finalTokens.length) {
+          const tail = finalTokens.slice(-14).join(" ");
+          processTranscript(tail, false, true);
         }
+
         latestTranscriptChanged = false;
-
-        // 인식 패킷이 오지 않는 사이에도 마이크에서 말하고 있으면
-        // 추정 속도만큼 초록색 위치를 매 0.1초 전진시킨다.
-        const speaking = sampleVoiceActivity();
-        if (speaking) {
-          const predictionLimit = Math.min(
-            scriptWords.length - 1,
-            currentIndex + MAX_PREDICTION_AHEAD_WORDS
-          );
-          predictedPosition = Math.min(
-            predictionLimit,
-            predictedPosition + speechRateWps * elapsed
-          );
-        }
-
-        // 실제 화면 반영은 매 tick마다 반드시 실행한다.
-        renderCue(true);
-
-        setStatus(
-          speaking
-            ? `실시간 0.1초 · 말하는 중 · ${Math.round(speechRateWps * 60)} WPM`
-            : `실시간 0.1초 · 음성 대기`,
-          true
-        );
       }
 
       function startTrackingLoop() {
         stopTrackingLoop();
-        lastTrackingTickAt = performance.now();
         trackingTimer = setInterval(runTrackingTick, TRACK_INTERVAL_MS);
       }
 
@@ -1090,7 +886,6 @@
 
           latestInterimText = interim;
           latestTranscriptChanged = true;
-          lastSpeechEventAt = performance.now();
         };
 
         r.onerror = (event) => {
@@ -1107,7 +902,6 @@
             listening = false;
             manuallyStopped = true;
             stopTrackingLoop();
-            stopAudioMeter();
             updateButtons();
           }
         };
@@ -1129,7 +923,7 @@
         return r;
       }
 
-      async function startListening() {
+      function startListening() {
         if (!scriptWords.length) {
           applyScript();
           if (!scriptWords.length) return;
@@ -1147,14 +941,6 @@
         latestInterimText = "";
         latestTranscriptChanged = false;
         lastProcessedTranscript = "";
-        predictedPosition = currentIndex;
-        speechRateWps = DEFAULT_SPEECH_RATE_WPS;
-        lastMatchedAt = performance.now();
-        lastMatchedIndex = currentIndex;
-        lastSpeechEventAt = 0;
-
-        await startAudioMeter();
-
         recognition = createRecognition();
         startTrackingLoop();
 
@@ -1164,7 +950,6 @@
         } catch (error) {
           listening = false;
           stopTrackingLoop();
-          stopAudioMeter();
           updateButtons();
           toast("음성 인식을 시작하지 못했습니다.");
         }
@@ -1175,7 +960,6 @@
         listening = false;
         clearTimeout(recognitionRestartTimer);
         stopTrackingLoop();
-        stopAudioMeter();
         try { recognition?.stop(); } catch (_) {}
         recognition = null;
         latestInterimText = "";
