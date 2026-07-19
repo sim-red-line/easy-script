@@ -572,7 +572,7 @@
       // 결과 사이 구간은 마이크 음성 활동과 추정 말하기 속도로 전진한다.
       const TRACK_INTERVAL_MS = 100;
       const DEFAULT_SPEECH_RATE_WPS = 2.35;
-      const MAX_PREDICTION_AHEAD_WORDS = 12;
+      const MAX_PREDICTION_AHEAD_WORDS = 0;
 
       let trackingTimer = null;
       let latestInterimText = "";
@@ -792,38 +792,16 @@
       function applyRecognitionCorrection(index) {
         if (!scriptWords.length) return;
 
-        const now = performance.now();
         const matchedIndex = Math.max(
           0,
           Math.min(scriptWords.length - 1, index)
         );
 
-        // 실제 인식 위치 변화량으로 사용자의 현재 말하기 속도를 추정한다.
-        if (lastMatchedAt > 0 && matchedIndex > lastMatchedIndex) {
-          const seconds = (now - lastMatchedAt) / 1000;
-          const words = matchedIndex - lastMatchedIndex;
-
-          if (seconds >= 0.18 && seconds <= 5 && words <= 30) {
-            const observedRate = Math.max(
-              1.0,
-              Math.min(5.5, words / seconds)
-            );
-            speechRateWps = speechRateWps * 0.68 + observedRate * 0.32;
-          }
-        }
-
-        lastMatchedAt = now;
-        lastMatchedIndex = matchedIndex;
+        // 새 음성 인식 결과가 들어왔을 때만 위치를 변경한다.
         currentIndex = matchedIndex;
-
-        // 인식 결과가 예측보다 앞이면 즉시 따라잡는다.
-        // 예측이 조금 앞선 경우에는 뒤로 튀지 않게 유지하되,
-        // 너무 멀리 나갔으면 인식 위치 근처로 되돌린다.
-        if (matchedIndex >= predictedPosition) {
-          predictedPosition = matchedIndex;
-        } else if (predictedPosition - matchedIndex > 7) {
-          predictedPosition = matchedIndex + 1.5;
-        }
+        predictedPosition = matchedIndex;
+        lastMatchedIndex = matchedIndex;
+        lastMatchedAt = performance.now();
 
         renderCue(true);
       }
@@ -933,12 +911,12 @@
         els.transcriptBox.classList.add("show");
 
         if (match && match.confidence >= threshold) {
-          const maxForwardJump = isFinal ? 42 : 20;
+          const maxForwardJump = isFinal ? 16 : 7;
           const bounded = Math.min(match.index, currentIndex + maxForwardJump);
           const next = bounded < currentIndex - 4 ? currentIndex : bounded;
           applyRecognitionCorrection(next);
           setStatus(
-            `실시간 0.1초 · ${Math.round(speechRateWps * 60)} WPM · ${Math.round(match.confidence * 100)}%`,
+            `실시간 0.1초 · 인식 ${Math.round(match.confidence * 100)}%`,
             true
           );
         } else {
@@ -960,36 +938,19 @@
       function runTrackingTick() {
         if (!listening || !scriptWords.length) return;
 
-        const now = performance.now();
-        const elapsed = lastTrackingTickAt
-          ? Math.min(0.25, (now - lastTrackingTickAt) / 1000)
-          : TRACK_INTERVAL_MS / 1000;
-        lastTrackingTickAt = now;
+        lastTrackingTickAt = performance.now();
 
-        // 인식 결과는 onresult에서 즉시 반영한다.
-        latestTranscriptChanged = false;
+        // 화면은 0.1초마다 갱신하지만, 위치는 인식 결과가 올 때만 바뀐다.
+        predictedPosition = currentIndex;
+        renderCue(false);
 
-        // 인식 패킷이 오지 않는 사이에도 마이크에서 말하고 있으면
-        // 추정 속도만큼 초록색 위치를 매 0.1초 전진시킨다.
-        const speaking = sampleVoiceActivity();
-        if (speaking) {
-          const predictionLimit = Math.min(
-            scriptWords.length - 1,
-            currentIndex + MAX_PREDICTION_AHEAD_WORDS
-          );
-          predictedPosition = Math.min(
-            predictionLimit,
-            predictedPosition + speechRateWps * elapsed
-          );
-        }
-
-        // 실제 화면 반영은 매 tick마다 반드시 실행한다.
-        renderCue(true);
+        const recentlyRecognized =
+          performance.now() - lastSpeechEventAt < 700;
 
         setStatus(
-          speaking
-            ? `실시간 0.1초 · 말하는 중 · ${Math.round(speechRateWps * 60)} WPM`
-            : `실시간 0.1초 · 음성 대기`,
+          recentlyRecognized
+            ? "실시간 0.1초 · 음성 반영 중"
+            : "실시간 0.1초 · 다음 음성 대기",
           true
         );
       }
